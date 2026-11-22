@@ -78,7 +78,7 @@ const setup = { ...credentials, confirmPassword: credentials.password, setupKey 
 try {
   let primary = await start(18787, 'primary');
   const home = await primary.call('/');
-  expect(home.status === 200 && home.body.includes('家长查询码'), 'Parent page');
+  expect(home.status === 200 && home.body.includes('id="child-query"') && !home.body.includes('id="child-code"'), 'Parent page');
   const admin = await primary.call('/admin');
   expect(admin.status === 200 && admin.body.includes('管理后台'), 'Admin page');
   expect((await primary.call('/demo')).status === 404, 'Demo page unavailable');
@@ -88,10 +88,11 @@ try {
   const created = await primary.call('/api/admin/students', { name: '验收甲', group: '测试', balance: 4 });
   expect(created.status === 201 && created.body.student.parentCode.length === 16, 'Synthetic student and query code');
   const student = created.body.student;
-  const lookup = { name: student.name, code: student.parentCode };
-  expect((await primary.call('/api/search', { name: student.name })).status === 400, 'Name alone cannot retrieve data');
+  const lookup = { name: student.name };
+  expect((await primary.call('/api/search', lookup)).body.students.length === 0, 'Students start private');
+  expect((await primary.call('/api/admin/public-lookup', { id: student.id, enabled: true })).body.enabled, 'Admin enables name lookup');
   const initial = await primary.call('/api/search', lookup, { auth: false });
-  expect(initial.body.students[0].balance === 4, 'Unauthenticated parent with correct code');
+  expect(initial.body.students[0].balance === 4, 'Unauthenticated parent enters only the name');
   const lesson = { id: student.id, date, requestId: 'worker-check-lesson1', expectedCount: 0 };
   expect((await primary.call('/api/admin/lesson', lesson)).body.student.balance === 3, 'Lesson decrements balance');
   expect((await primary.call('/api/admin/lesson', lesson)).body.student.balance === 3, 'Retry retains balance');
@@ -120,6 +121,8 @@ try {
   const recovered = await recovery.call('/api/admin/export');
   for (const table of ['students', 'lessons', 'audit_log']) assert.deepEqual(recovered.body[table], backup.body[table]);
   checks++;
+  expect((await recovery.call('/api/search', lookup)).body.students.length === 0, 'Restored records start private');
+  expect((await recovery.call('/api/admin/public-lookup', { id: student.id, enabled: true })).body.enabled, 'Admin enables restored record');
   const restoredParent = await recovery.call('/api/search', lookup, { auth: false });
   expect(restoredParent.body.students[0].balance === 3 && restoredParent.body.students[0].records.length === 1, 'Restored parent data and ledger are consistent');
   console.log(`PASS: ${checks} local Cloudflare Worker/D1 checks.`);

@@ -28,6 +28,9 @@ async function getAdminSession(req,db){const token=(req.headers.get('cookie')||'
 async function requireAdmin(req,db){const s=await getAdminSession(req,db);if(!s)fail(401,'请先登录管理员账号。');return s}
 async function session(db){const token=rand();await db.batch([db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').bind(Date.now()),db.prepare('INSERT INTO admin_sessions (token_hash,expires_at) VALUES (?,?)').bind(await hash(token),Date.now()+SESSION_DAYS*DAY)]);return token}
 async function getStudent(db,studentId,withAudit=false){const s=await db.prepare('SELECT id,code,name,class_name,balance,parent_code FROM students WHERE id=?').bind(studentId).first();if(!s)fail(404,'学生档案不存在。');const records=(await db.prepare('SELECT id,lesson_date AS date,created_at AS created FROM lessons WHERE student_id=? AND active=1 ORDER BY lesson_date DESC,created_at DESC').bind(studentId).all()).results;const a=withAudit?(await db.prepare('SELECT description,created_at FROM audit_log WHERE student_id=? ORDER BY created_at DESC LIMIT 200').bind(studentId).all()).results.map(x=>`${x.created_at.slice(0,10)} · ${x.description}`):[];return {id:s.id,code:s.code,name:s.name,group:s.class_name,balance:s.balance,records,audit:a,...(withAudit?{parentCode:s.parent_code}:{})}}
+async function publicLookupTableExists(db) {
+  return !!await db.prepare("SELECT 1 AS present FROM sqlite_schema WHERE type='table' AND name='public_student_lookup'").first();
+}
 function auditStmt(db,studentId,action,description){return db.prepare('INSERT INTO audit_log (id,student_id,action,description,created_at) VALUES (?,?,?,?,?)').bind(id(),studentId,action,description,timestamp())}
 export async function handleApi(req,env){try{const db=env.DB;if(!db)fail(503,'数据库暂不可用，请稍后重试。');const url=new URL(req.url),path=url.pathname.replace(/\/$/,'');if(req.method==='POST'){const origin=req.headers.get('origin');if(origin!==url.origin)fail(403,'请求来源无效，请从本站重新操作。')}
 const ip=req.headers.get('cf-connecting-ip')||'unknown';
@@ -39,31 +42,54 @@ if(path==='/api/search'&&req.method==='POST'){
   await rate(db,'search:'+ip,20,60000);
   const b=await bodyOf(req);
   const name=nameKey(textField(b.name,'姓名',30));
-  const code=typeof b.code==='string'?b.code.replace(/[\s-]+/g,'').toUpperCase():'';
-  if(!/^[A-F0-9]{16}$/.test(code))fail(400,'请输入老师提供的16位查询码。');
-  const row=await db.prepare('SELECT id FROM students WHERE parent_code=? AND name_key=?').bind(code,name).first();
-  if(!row)return json({students:[]});
-  const student=await getStudent(db,row.id);
-  student.records=student.records.map(({date})=>({date}));
-  return json({students:[student]});
+  if(!await publicLookupTableExists(db))return json({students:[]});
+  const {results:rows}=await db.prepare(`
+    WITH matches AS (SELECT id,name,name_key,balance FROM students WHERE name_key=? LIMIT 2)
+    SELECT m.name,m.balance,l.lesson_date AS date
+    FROM matches m
+    JOIN public_student_lookup p ON p.student_id=m.id AND p.name_key=m.name_key
+    LEFT JOIN lessons l ON l.student_id=m.id AND l.active=1
+    WHERE (SELECT count(*) FROM matches)=1
+    ORDER BY l.lesson_date DESC,l.created_at DESC
+  `).bind(name).all();
+  if(!rows.length)return json({students:[]});
+  const {name:studentName,balance}=rows[0];
+  const records=rows.filter(row=>row.date!==null).map(({date})=>({date}));
+  return json({students:[{name:studentName,balance,records}]});
 }
 if(path.startsWith('/api/admin/')){await requireAdmin(req,db);
 if(path==='/api/admin/students'&&req.method==='GET'){const rows=(await db.prepare('SELECT id,code,name,class_name AS "group",balance FROM students ORDER BY created_at DESC').all()).results;return json({students:rows})}
 if(path==='/api/admin/student'&&req.method==='GET')return json({student:await getStudent(db,url.searchParams.get('id')||'',true)});
 if(path==='/api/admin/students'&&req.method==='POST'){const b=await bodyOf(req),name=textField(b.name,'姓名',30),group=textField(b.group,'班级',40),balance=balanceField(b.balance),studentId=b.requestId?identifier(b.requestId):id(),code='YB'+rand(4).toUpperCase();const prior=await db.prepare('SELECT name_key,class_name FROM students WHERE id=?').bind(studentId).first();if(prior){if(prior.name_key!==nameKey(name)||prior.class_name!==group)fail(409,'该请求已保存，请刷新查看。');return json({student:await getStudent(db,studentId,true),alreadySaved:true})}await db.batch([db.prepare('INSERT INTO students (id,code,name,name_key,class_name,balance,created_at,parent_code) VALUES (?,?,?,?,?,?,?,?)').bind(studentId,code,name,nameKey(name),group,balance,timestamp(),rand(8).toUpperCase()),auditStmt(db,studentId,'create',`建立档案，初始剩余 ${balance} 课时`)]);return json({student:await getStudent(db,studentId,true)},201)}
-if(path==='/api/admin/profile'&&req.method==='POST'){const b=await bodyOf(req),studentId=identifier(b.id),s=await getStudent(db,studentId),name=textField(b.name,'姓名',30),group=textField(b.group,'班级',40);await db.batch([db.prepare('UPDATE students SET name=?,name_key=?,class_name=? WHERE id=?').bind(name,nameKey(name),group,studentId),auditStmt(db,studentId,'profile',`档案修改：${s.name} / ${s.group} → ${name} / ${group}`)]);return json({student:await getStudent(db,studentId,true)})}
+if(path==='/api/admin/profile'&&req.method==='POST'){const b=await bodyOf(req),studentId=identifier(b.id),s=await getStudent(db,studentId),name=textField(b.name,'姓名',30),group=textField(b.group,'班级',40);const changes=[db.prepare('UPDATE students SET name=?,name_key=?,class_name=? WHERE id=?').bind(name,nameKey(name),group,studentId),auditStmt(db,studentId,'profile',`档案修改：${s.name} / ${s.group} → ${name} / ${group}`)];if(nameKey(s.name)!==nameKey(name)&&await publicLookupTableExists(db))changes.push(db.prepare('DELETE FROM public_student_lookup WHERE student_id=?').bind(studentId));await db.batch(changes);return json({student:await getStudent(db,studentId,true)})}
 if(path==='/api/admin/balance'&&req.method==='POST'){const b=await bodyOf(req),studentId=identifier(b.id),balance=balanceField(b.balance),expected=balanceField(b.expectedBalance),reason=textField(b.reason,'调整原因',120);const result=await db.batch([db.prepare('UPDATE students SET balance=? WHERE id=? AND balance=?').bind(balance,studentId,expected),db.prepare('INSERT INTO audit_log(id,student_id,action,description,created_at) SELECT ?,?,?,?,? WHERE changes()=1').bind(id(),studentId,'balance',`剩余课时 ${expected} → ${balance}；原因：${reason}`,timestamp())]);if(!result[0].meta.changes)fail(409,'课时已被其他操作更新，请刷新后核对。');return json({student:await getStudent(db,studentId,true)})}
 if(path==='/api/admin/lesson'&&req.method==='POST'){const b=await bodyOf(req),studentId=identifier(b.id),requestId=identifier(b.requestId);if(!validDate(b.date))fail(400,'请选择有效的上课日期，不能记录未来日期。');if(!Number.isInteger(b.expectedCount)||b.expectedCount<0)fail(400,'请重新确认当天上课次数。');const existing=await db.prepare('SELECT student_id,lesson_date FROM lessons WHERE id=?').bind(requestId).first();if(existing){if(existing.student_id!==studentId||existing.lesson_date!==b.date)fail(409,'请求已被使用。');return json({student:await getStudent(db,studentId,true),alreadySaved:true})}try{const result=await db.prepare('INSERT INTO lessons(id,student_id,lesson_date,active,created_at) SELECT ?,?,?,1,? WHERE (SELECT count(*) FROM lessons WHERE student_id=? AND lesson_date=? AND active=1)=?').bind(requestId,studentId,b.date,timestamp(),studentId,b.date,b.expectedCount).run();if(!result.meta.changes)fail(409,'当天上课记录已变化，请刷新后确认是否增加一次。')}catch(e){if(String(e).includes('INSUFFICIENT_BALANCE'))fail(409,'剩余课时不足，请先核对余额。');if(String(e).includes('UNIQUE constraint failed: lessons.id')){const prior=await db.prepare('SELECT student_id,lesson_date FROM lessons WHERE id=?').bind(requestId).first();if(prior?.student_id===studentId&&prior.lesson_date===b.date)return json({student:await getStudent(db,studentId,true),alreadySaved:true});fail(409,'请求已被使用。');}throw e}return json({student:await getStudent(db,studentId,true)},201)}
 if(path==='/api/admin/lesson/undo'&&req.method==='POST'){const b=await bodyOf(req),studentId=identifier(b.id),lessonId=identifier(b.lessonId);const existing=await db.prepare('SELECT id FROM lessons WHERE id=? AND student_id=?').bind(lessonId,studentId).first();if(!existing)fail(404,'上课记录不存在。');await db.prepare('UPDATE lessons SET active=0,voided_at=? WHERE id=? AND student_id=? AND active=1').bind(timestamp(),lessonId,studentId).run();return json({student:await getStudent(db,studentId,true)})}
 if(path==='/api/admin/password'&&req.method==='POST'){await rate(db,'password:'+ip,10,900000);const b=await bodyOf(req),oldPassword=passwordField(b.oldPassword,'当前密码'),newPassword=passwordField(b.password,'新密码');if(newPassword.length<10||newPassword!==b.confirmPassword)fail(400,'新密码至少 10 个字符，且两次输入须一致。');const admin=await db.prepare('SELECT password_hash,salt FROM administrator WHERE id=1').first();if(!safeEqual(await derive(oldPassword,admin.salt),admin.password_hash))fail(401,'当前密码不正确。');const salt=rand(16),passwordHash=await derive(newPassword,salt);await db.batch([db.prepare('UPDATE administrator SET password_hash=?,salt=? WHERE id=1').bind(passwordHash,salt),db.prepare('DELETE FROM admin_sessions')]);return json({ok:true},200,{'Set-Cookie':cookie(await session(db))})}
-if(path==='/api/admin/parent-code'&&req.method==='POST'){
-  const b=await bodyOf(req), studentId=identifier(b.id), code=rand(8).toUpperCase();
-  if(!await db.prepare('SELECT id FROM students WHERE id=?').bind(studentId).first())fail(404,'学生档案不存在。');
-  await db.batch([
-    db.prepare('UPDATE students SET parent_code=? WHERE id=?').bind(code,studentId),
-    auditStmt(db,studentId,'parent-code','更新了家长查询码'),
-  ]);
-  return json({student:await getStudent(db,studentId,true)});
+if(path==='/api/admin/public-lookup'&&req.method==='GET'){
+  const studentId=identifier(url.searchParams.get('id'));
+  const available=await publicLookupTableExists(db);
+  const setting=available&&await db.prepare('SELECT 1 AS enabled FROM public_student_lookup p JOIN students s ON s.id=p.student_id AND s.name_key=p.name_key WHERE p.student_id=?').bind(studentId).first();
+  return json({enabled:!!setting});
+}
+if(path==='/api/admin/public-lookup'&&req.method==='POST'){
+  const b=await bodyOf(req), studentId=identifier(b.id);
+  if(typeof b.enabled!=='boolean')fail(400,'请选择是否开启姓名查询。');
+  await db.prepare(`CREATE TABLE IF NOT EXISTS public_student_lookup (
+    student_id TEXT PRIMARY KEY NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+    name_key TEXT NOT NULL
+  )`).run();
+  if(b.enabled){
+    const result=await db.prepare(`INSERT INTO public_student_lookup(student_id,name_key)
+      SELECT id,name_key FROM students WHERE id=? AND (SELECT count(*) FROM students WHERE name_key=
+        (SELECT name_key FROM students WHERE id=?))=1
+      ON CONFLICT(student_id) DO UPDATE SET name_key=excluded.name_key`
+    ).bind(studentId,studentId).run();
+    if(!result.meta.changes)fail(409,'档案不存在或有同名学员，无法开启姓名查询。');
+  }else{
+    await db.prepare('DELETE FROM public_student_lookup WHERE student_id=?').bind(studentId).run();
+  }
+  return json({enabled:b.enabled});
 }
 if(path==='/api/admin/export'&&req.method==='GET'){
   const snapshot=await exportSnapshot(db);
