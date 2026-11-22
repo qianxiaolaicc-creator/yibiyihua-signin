@@ -1,0 +1,9 @@
+/node_modules/
+/.wrangler/
+/.env*
+/.dev.vars*
+/data/
+/backups/
+*.sqlite*
+*.pem
+/wrangler.local.jsonc

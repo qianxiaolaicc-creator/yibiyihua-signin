@@ -1,0 +1,18 @@
+{
+  "name": "yibiyihua-signin",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "test": "node tests/api.test.mjs",
+    "test:worker": "node tests/worker.test.mjs",
+    "dev": "wrangler dev --local",
+    "check:bundle": "wrangler deploy --dry-run --outdir .wrangler/bundle"
+  },
+  "devDependencies": {
+    "wrangler": "4.92.0"
+  }
+}

@@ -1,0 +1,43 @@
+import {DatabaseSync} from 'node:sqlite';
+import fs from 'node:fs';
+import assert from 'node:assert/strict';
+import {handleApi,today} from '../server/api.mjs';
+const sql=new DatabaseSync(':memory:');sql.exec('PRAGMA foreign_keys=ON');for(const file of fs.readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort())sql.exec(fs.readFileSync('drizzle/'+file,'utf8'));
+class Stmt{constructor(text,values=[]){this.text=text;this.values=values}bind(...v){return new Stmt(this.text,v)}async first(){return sql.prepare(this.text).get(...this.values)||null}async all(){return {results:sql.prepare(this.text).all(...this.values)}}async run(){const r=sql.prepare(this.text).run(...this.values);return {meta:{changes:Number(r.changes)},success:true}}}
+const setupKey='TEST-ONLY-bootstrap-key-0123456789abcdef';
+const DB={prepare:t=>new Stmt(t),async batch(stmts){sql.exec('BEGIN');try{const r=[];for(const s of stmts)r.push(/^SELECT /.test(s.text)?await s.all():await s.run());sql.exec('COMMIT');return r}catch(e){sql.exec('ROLLBACK');throw e}}};
+let cookie='';async function call(path,data,opts={}){const headers={'origin':opts.origin||'https://test.local','cf-connecting-ip':opts.ip||'test-ip'};if(data!==undefined)headers['content-type']='application/json';if(opts.cookie!==false&&cookie)headers.cookie=cookie;if(opts.identity)headers['oai-authenticated-user-id']='test-owner';const r=await handleApi(new Request('https://test.local/api'+path,{method:data===undefined?'GET':'POST',headers,body:data===undefined?undefined:JSON.stringify(data)}),{DB,ADMIN_SETUP_KEY:opts.setupDisabled?undefined:setupKey});const json=await r.json();if(opts.storeCookie&&r.headers.get('set-cookie'))cookie=r.headers.get('set-cookie').split(';')[0];return {status:r.status,body:json,headers:r.headers}}
+let checks=0;function ok(condition,message){assert.ok(condition,message);checks++}
+let r=await call('/status',undefined,{setupDisabled:true});ok(!r.body.configured&&!r.body.setupAllowed,'No setup for anonymous');
+r=await call('/setup',{username:'teacher',password:'testing-password-123',confirmPassword:'testing-password-123'},{identity:true});ok(r.status===403,'Untrusted identity header cannot claim owner');
+r=await call('/setup',{username:'teacher',password:'testing-password-123',confirmPassword:'testing-password-123',setupKey},{identity:true,storeCookie:true});ok(r.status===201,'Owner can initialize');ok(r.headers.get('set-cookie').includes('HttpOnly')&&r.headers.get('set-cookie').includes('Secure'),'Cookie flags');
+r=await call('/setup',{username:'another',password:'testing-password-123',confirmPassword:'testing-password-123',setupKey},{identity:true});ok(r.status===409,'Only one admin');
+r=await call('/admin/students',undefined,{cookie:false});ok(r.status===401,'No anonymous roster');
+r=await call('/admin/students',{name:'子墨',group:'基础班',balance:3},{origin:'https://evil.test'});ok(r.status===403,'Cross origin mutation blocked');
+r=await call('/admin/students',{name:'子墨',group:'基础班',balance:3,requestId:'student-create-once'});ok(r.status===201,'Create student');const child=r.body.student;ok(child.balance===3&&child.records.length===0,'Initial balance does not manufacture lessons');
+r=await call('/admin/students',{name:'子墨',group:'基础班',balance:3,requestId:'student-create-once'});ok(r.body.alreadySaved&&r.body.student.id===child.id,'Retry does not create duplicate student');
+r=await call('/search',{name:'子',code:child.parentCode});ok(r.body.students.length===0,'Full name only');
+r=await call('/search',{name:'子墨'});ok(r.status===400,'Name alone cannot query lessons');
+r=await call('/search',{name:' 子墨 ',code:child.parentCode});ok(r.body.students[0].balance===3&&r.body.students[0].audit.length===0,'Parent exact lookup without audit');
+r=await call('/admin/lesson',{id:child.id,date:today(),requestId:'test-lesson-1',expectedCount:0});ok(r.status===201&&r.body.student.balance===2&&r.body.student.records.length===1,'One record deducts one');
+r=await call('/admin/lesson',{id:child.id,date:today(),requestId:'test-lesson-1',expectedCount:0});ok(r.status===200&&r.body.student.balance===2&&r.body.student.records.length===1,'Retry does not double deduct');
+r=await call('/admin/lesson',{id:child.id,date:today(),requestId:'test-race',expectedCount:0});ok(r.status===409,'Concurrent stale same-day request rejected');
+r=await call('/admin/lesson',{id:child.id,date:today(),requestId:'test-lesson-2',expectedCount:1});ok(r.status===201&&r.body.student.balance===1,'Explicit second lesson allowed');
+r=await call('/admin/lesson/undo',{id:child.id,lessonId:'test-lesson-1'});ok(r.body.student.balance===2&&r.body.student.records.length===1,'Undo returns exactly one');
+r=await call('/admin/lesson/undo',{id:child.id,lessonId:'test-lesson-1'});ok(r.body.student.balance===2,'Repeated undo does not double refund');
+r=await call('/admin/balance',{id:child.id,balance:0,expectedBalance:2,reason:'核对'});ok(r.body.student.balance===0&&r.body.student.records.length===1,'Balance edit leaves calendar intact');
+r=await call('/admin/balance',{id:child.id,balance:10,expectedBalance:2,reason:'陈旧的页面'});ok(r.status===409,'Stale balance edit rejected');
+r=await call('/admin/lesson',{id:child.id,date:today(),requestId:'test-zero',expectedCount:1});ok(r.status===409,'Zero balance blocks lesson');ok(sql.prepare('SELECT count(*) AS n FROM lessons WHERE id=?').get('test-zero').n===0,'Failed deduction does not leave record');
+r=await call('/admin/lesson',{id:child.id,date:'2099-01-01',requestId:'future',expectedCount:0});ok(r.status===400,'Future dates rejected');
+r=await call('/admin/lesson',{id:child.id,date:'2025-02-30',requestId:'invalid',expectedCount:0});ok(r.status===400,'Invalid date rejected');
+r=await call('/admin/students',{name:'子墨',group:'提升班',balance:5});const second=r.body.student;
+r=await call('/search',{name:'子墨',code:second.parentCode});ok(r.body.students.length===1&&r.body.students[0].id===second.id&&!r.body.students[0].parentCode,'Code distinguishes duplicate names without leaking credentials');
+r=await call('/search/detail',{name:'子墨',id:second.id});ok(r.status===404,'Legacy lookup cannot retrieve private data');
+r=await call('/admin/profile',{id:second.id,name:'子涵',group:'提升班'});ok(r.body.student.name==='子涵','Profile correction');
+r=await call('/search',{name:'子涵',code:second.parentCode});ok(r.body.students[0].id===second.id,'Renamed student searchable');
+r=await call('/admin/export');ok(r.body.students.length===2&&!JSON.stringify(r.body).includes('password_hash'),'Export does not expose credentials');
+r=await call('/admin/password',{oldPassword:'testing-password-123',password:'new-password-98765',confirmPassword:'new-password-98765'},{storeCookie:true});ok(r.status===200,'Password change');
+r=await call('/logout',{});cookie='';r=await call('/login',{username:'teacher',password:'testing-password-123'});ok(r.status===401,'Old password rejected');
+r=await call('/login',{username:'teacher',password:'new-password-98765'},{storeCookie:true});ok(r.status===200,'New password works');
+r=await call('/logout',{});r=await call('/admin/students');ok(r.status===401,'Session revoked server side');
+console.log(`PASS: ${checks} auth, query, ledger, retry, rollback and audit checks.`);
